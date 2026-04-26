@@ -1,63 +1,68 @@
 # vercel-xhttp-relay
 
-A high-performance **Rust relay server for Vercel Edge** that forwards
-**XHTTP** traffic to your backend Xray/V2Ray server. Use Vercel's globally
-distributed edge network (and its `vercel.com` / `*.vercel.app` SNI) as a
-front for your real Xray endpoint — useful in regions where the backend
-host is blocked but Vercel is reachable.
+A minimal **Vercel Edge Function** that relays **XHTTP** traffic to your
+backend Xray/V2Ray server. Use Vercel's globally distributed edge network
+(and its `vercel.com` / `*.vercel.app` SNI) as a front for your real Xray
+endpoint — useful in regions where the backend host is blocked but Vercel
+is reachable.
 
 > ⚠️ **XHTTP transport only.** This relay is purpose-built for Xray's
 > `xhttp` transport. It will **not** work with `WebSocket`, `gRPC`, `TCP`,
-> `mKCP`, `QUIC`, or any other V2Ray/Xray transport.
+> `mKCP`, `QUIC`, or any other V2Ray/Xray transport — the Edge runtime
+> doesn't support WebSocket upgrade or arbitrary TCP, and the other
+> transports rely on protocol features Edge `fetch` doesn't expose.
 
 ---
 
 ## How It Works
 
 ```
-┌──────────┐    TLS / SNI: *.vercel.app    ┌──────────────────┐    HTTP/2     ┌──────────────┐
-│  Client  │ ────────────────────────────► │   Vercel (this   │ ───────────►  │  Your Xray   │
-│ (v2rayN, │   XHTTP request (POST/GET)    │  Rust function)  │  XHTTP frames │  server with │
-│ xray-core│                               │  buffers + fwd   │  forwarded    │ XHTTP inbound│
-└──────────┘                               └──────────────────┘               └──────────────┘
+┌──────────┐   TLS / SNI: *.vercel.app    ┌──────────────────┐    HTTP/2     ┌──────────────┐
+│  Client  │ ───────────────────────────► │  Vercel Edge     │ ───────────►  │  Your Xray   │
+│ (v2rayN, │   XHTTP request (POST/GET)   │  (V8 isolate,    │  XHTTP frames │  server with │
+│ xray-core│                              │  streams body)   │  forwarded    │ XHTTP inbound│
+└──────────┘                              └──────────────────┘               └──────────────┘
 ```
 
 1. Your Xray client opens an XHTTP request to a Vercel domain
    (`your-app.vercel.app`, or any custom domain pointed at Vercel).
 2. The TLS handshake uses **Vercel's certificate / SNI**, so to a censor it
    looks like ordinary traffic to a legitimate Vercel-hosted site.
-3. The Rust function receives the request, copies the headers, method, and
-   body, then issues an equivalent request to your real Xray server defined
-   by `TARGET_DOMAIN`.
-4. The upstream response (status, headers, body) is returned to the client.
+3. The Edge function pipes the request body to your real Xray server
+   (`TARGET_DOMAIN`) as a `ReadableStream` — no buffering — and pipes the
+   upstream response back the same way.
 
-## Important: Buffered, not Streamed
+## Why Edge Runtime?
 
-Vercel's Rust runtime is built on AWS Lambda's request/response model:
-the entire request body is buffered in memory before your handler runs,
-and the entire response body is buffered before being sent back. **There
-is no true bidirectional streaming.**
+- **True bidirectional streaming** via WebStreams (`req.body` →
+  `fetch(..., { duplex: "half" })` → upstream response). First byte out as
+  soon as first byte in. This matches XHTTP's chunked POST/GET model
+  exactly.
+- **~5–50 ms cold starts.** Edge functions run in V8 isolates, not AWS
+  Lambda microVMs — roughly 10× faster to start than the equivalent
+  Rust/Go serverless function.
+- **Runs at every Vercel PoP globally.** Anycast routing puts your relay
+  within a few ms of every client, regardless of where your origin lives.
+- **No buildtime, no toolchain, no native deps.** A single ~60-line JS
+  file.
 
-This is why the relay is **XHTTP-only**:
+## High-load tuning baked in
 
-- XHTTP's `packet-up` / chunked POST mode uses many short, bounded HTTP
-  requests — each one fits naturally into Lambda's request/response model
-  and works through this relay without trouble.
-- Transports that rely on long-lived bidirectional streams (WebSocket,
-  gRPC, raw TCP, mKCP, QUIC) **cannot** work on Vercel's serverless Rust
-  runtime, regardless of how the relay is implemented.
+The handler is written for sustained throughput:
 
-If you need true streaming behind Vercel, you'd need Vercel's Edge
-*Middleware* (JavaScript only, with `WebStreams`) — not the Rust runtime.
-
-## Why Rust?
-
-- **Compiled native code** — header copying and request building run in
-  microseconds, minimizing the relay's contribution to total latency.
-- **HTTP/2 client by default** (`reqwest` with `http2_prior_knowledge`)
-  — matches the protocol XHTTP backends speak.
-- **Vercel's anycast edge** — clients connect to the closest PoP and
-  benefit from Vercel's optimized backbone to your origin.
+- `TARGET_DOMAIN` is read **once at cold start** and cached at module
+  scope — no env lookup per request.
+- URL parsing is skipped entirely — `req.url.indexOf("/", 8)` + `slice`
+  extracts the path+query without allocating a `URL` object.
+- Headers are filtered in a **single pass**: hop-by-hop headers
+  (`connection`, `keep-alive`, `transfer-encoding`, …), Vercel telemetry
+  (`x-vercel-*`), and Vercel-edge `x-forwarded-host/proto/port` are
+  dropped. The client's real IP (`x-real-ip` or original
+  `x-forwarded-for`) is forwarded as `x-forwarded-for`.
+- `fetch(targetUrl, options)` is called directly — no extra
+  `new Request(...)` allocation.
+- `redirect: "manual"` keeps Vercel from chasing 3xx upstream and
+  breaking the XHTTP framing.
 
 ---
 
@@ -69,24 +74,26 @@ If you need true streaming behind Vercel, you'd need Vercel's Edge
   host (this is your `TARGET_DOMAIN`).
 - [Vercel CLI](https://vercel.com/docs/cli): `npm i -g vercel`
 - A Vercel account (Pro recommended for higher bandwidth and concurrent
-  connection limits).
+  invocation limits).
 
 ### 2. Configure Environment Variable
 
-In the Vercel Dashboard → your project → **Settings → Environment Variables**,
-add:
+In the Vercel Dashboard → your project → **Settings → Environment
+Variables**, add:
 
-| Name            | Example                          | Description                                   |
-| --------------- | -------------------------------- | --------------------------------------------- |
-| `TARGET_DOMAIN` | `https://xray.example.com:2096`  | Full URL of your backend Xray XHTTP endpoint. |
+| Name            | Example                          | Description                                           |
+| --------------- | -------------------------------- | ----------------------------------------------------- |
+| `TARGET_DOMAIN` | `https://xray.example.com:2096`  | Full origin URL of your backend Xray XHTTP endpoint.  |
 
-> Use `https://` if your backend terminates TLS, `http://` if it's plain.
-> Include a non-default port if needed.
+Notes:
+- Use `https://` if your backend terminates TLS, `http://` if plain.
+- Include a non-default port if needed.
+- Trailing slashes are stripped automatically.
 
 ### 3. Deploy
 
 ```bash
-git clone https://github.com/ramynn/vercel-xhttp-relay.git
+git clone https://github.com/<you>/vercel-xhttp-relay.git
 cd vercel-xhttp-relay
 
 vercel --prod
@@ -100,7 +107,8 @@ After deployment Vercel gives you a URL like `your-app.vercel.app`.
 
 In your client config, point the **address** at your Vercel domain and set
 **SNI / Host** to a `vercel.com`-family hostname. The `id`, `path`, and
-inbound settings must match what your real Xray server expects.
+inbound settings must match what your real Xray server expects — the relay
+is transport-agnostic and just forwards bytes.
 
 ### Example VLESS share link
 
@@ -141,7 +149,7 @@ vless://UUID@your-app.vercel.app:443?encryption=none&security=tls&sni=your-app.v
 - You can use **any Vercel-fronted hostname** for SNI as long as the TLS
   handshake reaches Vercel. Custom domains pointed at Vercel work too.
 - The `path` and `id` (UUID) must match the **backend Xray** XHTTP inbound,
-  not this relay — the relay is transport-agnostic and just pipes bytes.
+  not this relay.
 - If censorship targets `*.vercel.app` directly, attach a custom domain in
   the Vercel dashboard and use that as both `address` and `sni`.
 
@@ -149,31 +157,25 @@ vless://UUID@your-app.vercel.app:443?encryption=none&security=tls&sni=your-app.v
 
 ## Limitations
 
-- **XHTTP only.** WebSocket / gRPC / raw TCP / mKCP / QUIC transports do
-  **not** work because Vercel's serverless Rust runtime cannot stream.
-- **Bounded request size.** Each XHTTP request body is fully buffered in
-  memory by the runtime; very large single chunks may hit Vercel's request
-  size limit (≈ 4.5 MB for serverless functions).
-- **Function execution time.** Each request must finish within Vercel's
-  per-invocation timeout. XHTTP's chunked POST/GET model is short-lived
-  per request, so this is normally fine.
-- **Bandwidth costs.** All traffic counts against your Vercel account's
-  bandwidth quota. Heavy use → upgrade to Pro/Enterprise.
-- **Logging.** Vercel logs request metadata (path, IP, status). The body is
-  not logged, but be aware of the trust model.
+- **XHTTP only.** WebSocket / gRPC / raw TCP / mKCP / QUIC do **not** work
+  on Vercel's Edge runtime regardless of how the relay is implemented.
+- **Edge per-invocation CPU budget** (~50 ms compute on Hobby, more on
+  Pro). I/O wait time doesn't count, so streaming proxies stay well within
+  budget — but a stuck upstream can hit the wall-clock limit.
+- **Bandwidth quotas.** All traffic counts against your Vercel account's
+  quota. Heavy use → upgrade to Pro/Enterprise.
+- **Logging.** Vercel logs request metadata (path, IP, status). The body
+  is not logged, but be aware of the trust model.
 
 ## Project Layout
 
 ```
 .
-├── api/index.rs   # Serverless function: forwards request → TARGET_DOMAIN, returns response
-├── Cargo.toml     # Rust dependencies (vercel_runtime, reqwest, tokio)
-├── vercel.json    # Routes all paths → /api/index, region pinned to fra1
+├── api/index.js     # Edge function: streams request → TARGET_DOMAIN, streams response back
+├── package.json     # Project metadata (no runtime deps; fetch/Headers are globals)
+├── vercel.json      # Routes all paths → /api/index
 └── README.md
 ```
-
-To change the deployment region, edit `regions` in `vercel.json` (e.g.
-`["sin1"]`, `["iad1"]`).
 
 ## License
 
