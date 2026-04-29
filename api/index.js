@@ -1,5 +1,7 @@
 export const config = { runtime: "edge" };
 
+//salam
+
 const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
 const STRIP_HEADERS = new Set([
